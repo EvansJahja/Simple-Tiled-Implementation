@@ -1750,8 +1750,14 @@ end
 -- @field polyline List of verticies of specific shape
 -- @see Map.objects
 
---- Build Wang tile lookup tables from tileset wangsets data
--- Creates bidirectional mappings for efficient terrain tile lookups
+--- Build Wang tile (terrain) lookup tables from tileset wangsets data.
+-- This function MUST be called after loading a map if you want to use terrain functions.
+-- It parses the wangsets embedded in tilesets and creates:
+--   - Forward lookup (wangIdToGids): Given a Wang pattern, find matching tiles
+--   - Reverse lookup (gidToWangInfo): Given a tile GID, find its Wang info
+-- Without these lookups, setTerrain/removeTerrain will not work.
+-- Called automatically during Map:init() if wangsets are present.
+-- @local
 function Map:buildWangLookups()
 	self.wangsets = {}
 	self.wangIdToGids = {}   -- wangsetName -> wangIdKey -> list of {gid, probability}
@@ -1815,16 +1821,14 @@ function Map:buildWangLookups()
 	end
 end
 
---- Convert Wang ID array to string key for hash lookup
--- @param wangId Array of 8 color indices
--- @return string Hash key
+-- Convert Wang ID array to string key for hash lookup (internal helper)
 local function wangIdToKey(wangId)
 	return table.concat(wangId, ",")
 end
 
---- Select a tile from candidates weighted by probability
--- @param candidates Array of {gid, probability} tables
--- @return number Selected GID
+-- Select a tile from candidates weighted by probability (internal helper)
+-- Tiled allows multiple tiles to share the same Wang ID with different probabilities.
+-- This provides visual variety when painting terrain.
 local function selectWeightedTile(candidates)
 	if #candidates == 0 then
 		return nil
@@ -1852,11 +1856,15 @@ local function selectWeightedTile(candidates)
 	return candidates[#candidates].gid
 end
 
---- Get the terrain color at a tile position
--- @param layer The layer name or layer object
--- @param x Tile X coordinate
--- @param y Tile Y coordinate
--- @return table {wangset, colorId} or nil if no terrain
+--- Get the terrain data at a tile position.
+-- Used internally by computeWangId to check neighboring tiles.
+-- Also useful for querying terrain state in game logic.
+-- @param layer The layer name (string) or layer object
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @return table {wangset=string, colorId=number} or nil if no terrain
+-- @usage local t = map:getTerrain("Ground", 5, 10)
+-- @usage if t then print("Has terrain: " .. t.wangset) end
 function Map:getTerrain(layer, x, y)
 	if type(layer) == "string" then
 		layer = self.layers[layer]
@@ -1870,16 +1878,23 @@ function Map:getTerrain(layer, x, y)
 	return nil
 end
 
---- Compute Wang ID for a position based on neighboring terrain
--- Wang ID format (Tiled order, clockwise from top):
--- [1]=T edge, [2]=TR corner, [3]=R edge, [4]=BR corner,
--- [5]=B edge, [6]=BL corner, [7]=L edge, [8]=TL corner
--- @param layer The layer object
--- @param x Tile X coordinate
--- @param y Tile Y coordinate
+--- Compute the Wang ID for a position based on neighboring terrain.
+-- This is the core algorithm that examines all 8 neighbors and produces
+-- an 8-value pattern that uniquely identifies what tile shape is needed.
+--
+-- Wang ID format (Tiled order, 8 values clockwise from top):
+--   [1]=Top edge, [2]=Top-Right corner, [3]=Right edge, [4]=Bottom-Right corner,
+--   [5]=Bottom edge, [6]=Bottom-Left corner, [7]=Left edge, [8]=Top-Left corner
+--
+-- For "mixed" wangsets (terrain with both edges and corners), corners are only
+-- set when BOTH adjacent edges are present. This ensures proper tile transitions.
+-- @local
+-- @param layer The layer object (not name)
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
 -- @param wangsetName Name of the wangset
--- @param colorId The color ID to check for
--- @return table 8-value Wang ID array
+-- @param colorId The color ID (terrain type) to check for
+-- @return table 8-value Wang ID array where each value is colorId or 0
 function Map:computeWangId(layer, x, y, wangsetName, colorId)
 	local wangId = {0, 0, 0, 0, 0, 0, 0, 0}
 
@@ -1918,10 +1933,14 @@ function Map:computeWangId(layer, x, y, wangsetName, colorId)
 	return wangId
 end
 
---- Find matching tile GID for a Wang ID
+--- Find a matching tile GID for a computed Wang ID.
+-- Looks up the pre-built wangIdToGids table created by buildWangLookups().
+-- If multiple tiles match (Tiled allows this for variety), one is selected
+-- randomly weighted by the probability set in Tiled.
+-- @local
 -- @param wangsetName Name of the wangset
--- @param wangId 8-value Wang ID array
--- @return number GID of matching tile, or nil if no match
+-- @param wangId 8-value Wang ID array from computeWangId()
+-- @return number GID of matching tile, or nil if no tile matches this pattern
 function Map:findWangTile(wangsetName, wangId)
 	local lookup = self.wangIdToGids[wangsetName]
 	if not lookup then
@@ -1938,10 +1957,17 @@ function Map:findWangTile(wangsetName, wangId)
 	return selectWeightedTile(candidates)
 end
 
---- Update a single tile based on its terrain context
--- @param layer Layer object
--- @param x Tile X coordinate
--- @param y Tile Y coordinate
+--- Update a single tile's visual based on its terrain context.
+-- This is the workhorse function that ties everything together:
+-- 1. Reads the terrain data at (x,y) via getTerrain()
+-- 2. Computes the required Wang ID via computeWangId()
+-- 3. Finds the matching tile via findWangTile()
+-- 4. Updates the layer via setLayerTile()
+-- Called internally by setTerrain/removeTerrain for the affected area.
+-- @local
+-- @param layer Layer object (not name)
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
 function Map:updateTerrainTile(layer, x, y)
 	-- Bounds check
 	if x < 1 or y < 1 or x > layer.width or y > layer.height then
@@ -1968,12 +1994,16 @@ function Map:updateTerrainTile(layer, x, y)
 	end
 end
 
---- Set terrain at a tile position and update surrounding tiles
--- @param layer Layer name or layer object
--- @param x Tile X coordinate
--- @param y Tile Y coordinate
--- @param wangsetName Name of the wangset to use
--- @param colorId Color ID (terrain type) to place (1-based index into wangset.colors)
+--- Set terrain at a tile position and update surrounding tiles.
+-- This is the main public API for placing terrain dynamically.
+-- It stores the terrain data and updates the tile plus all 8 neighbors,
+-- since neighbor tiles may need different shapes after this change.
+-- @param layer Layer name (string) or layer object
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @param wangsetName Name of the wangset (as defined in Tiled)
+-- @param colorId Color/terrain ID to place (1-based index into wangset.colors)
+-- @usage map:setTerrain("Ground", 5, 10, "Grass Terrain", 1)
 function Map:setTerrain(layer, x, y, wangsetName, colorId)
 	if type(layer) == "string" then
 		layer = self.layers[layer]
@@ -2011,10 +2041,13 @@ function Map:setTerrain(layer, x, y, wangsetName, colorId)
 	end
 end
 
---- Remove terrain at a tile position and update surrounding tiles
--- @param layer Layer name or layer object
--- @param x Tile X coordinate
--- @param y Tile Y coordinate
+--- Remove terrain at a tile position and update surrounding tiles.
+-- Clears the terrain data and removes the tile. Also updates all 8 neighbors
+-- since they may need different edge/corner shapes.
+-- @param layer Layer name (string) or layer object
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @usage map:removeTerrain("Ground", 5, 10)
 function Map:removeTerrain(layer, x, y)
 	if type(layer) == "string" then
 		layer = self.layers[layer]
@@ -2037,14 +2070,18 @@ function Map:removeTerrain(layer, x, y)
 	end
 end
 
---- Set terrain for a rectangular area
--- @param layer Layer name or layer object
--- @param x1 Start X coordinate
--- @param y1 Start Y coordinate
--- @param x2 End X coordinate
--- @param y2 End Y coordinate
+--- Set terrain for a rectangular area (batch operation).
+-- More efficient than calling setTerrain() in a loop because it only
+-- updates the border tiles once after setting all terrain data.
+-- Useful for filling larger areas or creating buildings/platforms.
+-- @param layer Layer name (string) or layer object
+-- @param x1 Start X coordinate (1-based, inclusive)
+-- @param y1 Start Y coordinate (1-based, inclusive)
+-- @param x2 End X coordinate (1-based, inclusive)
+-- @param y2 End Y coordinate (1-based, inclusive)
 -- @param wangsetName Name of the wangset
--- @param colorId Color ID to place
+-- @param colorId Color/terrain ID to place
+-- @usage map:setTerrainRect("Ground", 5, 5, 8, 8, "Grass Terrain", 1) -- 4x4 area
 function Map:setTerrainRect(layer, x1, y1, x2, y2, wangsetName, colorId)
 	if type(layer) == "string" then
 		layer = self.layers[layer]
@@ -2084,12 +2121,14 @@ function Map:setTerrainRect(layer, x1, y1, x2, y2, wangsetName, colorId)
 	end
 end
 
---- Remove terrain from a rectangular area
--- @param layer Layer name or layer object
--- @param x1 Start X coordinate
--- @param y1 Start Y coordinate
--- @param x2 End X coordinate
--- @param y2 End Y coordinate
+--- Remove terrain from a rectangular area (batch operation).
+-- More efficient than calling removeTerrain() in a loop.
+-- @param layer Layer name (string) or layer object
+-- @param x1 Start X coordinate (1-based, inclusive)
+-- @param y1 Start Y coordinate (1-based, inclusive)
+-- @param x2 End X coordinate (1-based, inclusive)
+-- @param y2 End Y coordinate (1-based, inclusive)
+-- @usage map:removeTerrainRect("Ground", 5, 5, 8, 8)
 function Map:removeTerrainRect(layer, x1, y1, x2, y2)
 	if type(layer) == "string" then
 		layer = self.layers[layer]
@@ -2120,10 +2159,15 @@ function Map:removeTerrainRect(layer, x1, y1, x2, y2)
 	end
 end
 
---- Initialize terrain data from existing tiles on a layer
--- Scans a layer and populates terrainData based on current wang tiles
--- @param layer Layer name or layer object
--- @param wangsetName Name of the wangset to use for detection
+--- Initialize terrain data from existing tiles on a layer.
+-- Call this if you want to modify terrain that was painted in Tiled editor.
+-- Without this, the layer has tiles but no terrainData, so removeTerrain()
+-- wouldn't know which tiles belong to which terrain.
+-- Scans all tiles and uses gidToWangInfo (reverse lookup) to populate terrainData.
+-- @param layer Layer name (string) or layer object
+-- @param wangsetName Optional: only detect tiles from this wangset (nil = all)
+-- @usage map:initTerrainFromLayer("Ground")  -- Detect all terrain
+-- @usage map:initTerrainFromLayer("Ground", "Hills")  -- Only Hills wangset
 function Map:initTerrainFromLayer(layer, wangsetName)
 	if type(layer) == "string" then
 		layer = self.layers[layer]
@@ -2154,8 +2198,10 @@ function Map:initTerrainFromLayer(layer, wangsetName)
 	end
 end
 
---- Get list of available wangset names
--- @return table Array of wangset names
+--- Get list of available wangset names.
+-- Useful for debugging or building terrain selection UI.
+-- @return table Array of wangset name strings
+-- @usage for _, name in ipairs(map:getWangsetNames()) do print(name) end
 function Map:getWangsetNames()
 	local names = {}
 	for name, _ in pairs(self.wangsets) do
@@ -2164,9 +2210,12 @@ function Map:getWangsetNames()
 	return names
 end
 
---- Get wangset info by name
--- @param name Wangset name
--- @return table Wangset data or nil
+--- Get wangset metadata by name.
+-- Returns the parsed wangset data including colors, type, and tileset reference.
+-- @param name Wangset name (string)
+-- @return table {name, type, colors, tileset, firstgid} or nil if not found
+-- @usage local ws = map:getWangset("Grass Terrain")
+-- @usage print("Type: " .. ws.type)  -- "corner", "edge", or "mixed"
 function Map:getWangset(name)
 	return self.wangsets[name]
 end

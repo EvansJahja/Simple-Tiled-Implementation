@@ -82,6 +82,7 @@ function Map:init(path, plugins, ox, oy)
 	self.objects       = {}
 	self.tiles         = {}
 	self.tileInstances = {}
+	self.tileCallbacks = {}  -- Plugin callbacks for tile changes
 	self.offsetx = ox or 0
 	self.offsety = oy or 0
 
@@ -146,6 +147,13 @@ function Map:init(path, plugins, ox, oy)
 
 	-- Build Wang tile lookup tables for terrain support
 	self:buildWangLookups()
+end
+
+--- Register a callback for tile changes (used by plugins)
+-- @param callback Function(map, layer, x, y, oldTile, newTile)
+-- @local
+function Map:registerTileCallback(callback)
+	table.insert(self.tileCallbacks, callback)
 end
 
 --- Layers from the group are added to the list
@@ -1253,12 +1261,12 @@ function Map:setLayerTile(layer, x, y, gid)
 	layer = self.layers[layer]
 
 	layer.data[y] = layer.data[y] or {}
-	local tile = layer.data[y][x]
+	local oldTile = layer.data[y][x]
 	local instance
-	if tile then
-		local tileX, tileY = self:getLayerTilePosition(layer, tile, x, y)
-		if self.tileInstances[tile.gid] then
-			for _, inst in pairs(self.tileInstances[tile.gid]) do
+	if oldTile then
+		local tileX, tileY = self:getLayerTilePosition(layer, oldTile, x, y)
+		if self.tileInstances[oldTile.gid] then
+			for _, inst in pairs(self.tileInstances[oldTile.gid]) do
 				if inst.x == tileX and inst.y == tileY then
 					instance = inst
 					break
@@ -1267,18 +1275,25 @@ function Map:setLayerTile(layer, x, y, gid)
 		end
 	end
 
-	if tile == self.tiles[gid] then
+	local newTile = self.tiles[gid]
+
+	if oldTile == newTile then
 		return
 	end
 
-	tile = self.tiles[gid]
+	-- Notify plugins before change
+	for _, callback in ipairs(self.tileCallbacks) do
+		callback(self, layer, x, y, oldTile, newTile)
+	end
 
 	if instance then
-		self:swapTile(instance, tile)
+		self:swapTile(instance, newTile)
 	else
-		self:addNewLayerTile(layer, nil, tile, x, y)
+		if newTile then
+			self:addNewLayerTile(layer, nil, newTile, x, y)
+		end
 	end
-	layer.data[y][x] = tile
+	layer.data[y][x] = newTile
 end
 
 --- Swap a tile in a spritebatch

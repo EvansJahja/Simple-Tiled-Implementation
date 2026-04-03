@@ -263,6 +263,110 @@ return {
 		end
 
 		map.box2d_collision = collision
+		map.box2d_tileMap   = {}  -- Reverse lookup: [layerName][y][x] = collision_entry
+
+		-- Build reverse lookup for tile-based collision
+		for i, entry in ipairs(collision) do
+			if entry.object and entry.object.layer and entry.object.layer.type == "tilelayer" then
+				local instance = entry.object
+				if instance.x and instance.y and instance.layer then
+					local tileX = math.floor((instance.x - map.offsetx) / map.tilewidth) + 1
+					local tileY = math.floor((instance.y - map.offsety) / map.tileheight) + 1
+					
+					local layerName = instance.layer.name
+					map.box2d_tileMap[layerName] = map.box2d_tileMap[layerName] or {}
+					map.box2d_tileMap[layerName][tileY] = map.box2d_tileMap[layerName][tileY] or {}
+					map.box2d_tileMap[layerName][tileY][tileX] = entry
+				end
+			end
+		end
+
+		-- Register callback for dynamic tile changes
+		map:registerTileCallback(function(m, layer, x, y, oldTile, newTile)
+			local layerName = layer.name
+			
+			-- Remove old collision if exists
+			if oldTile and m.box2d_tileMap[layerName] and m.box2d_tileMap[layerName][y] and m.box2d_tileMap[layerName][y][x] then
+				local oldEntry = m.box2d_tileMap[layerName][y][x]
+				oldEntry.fixture:destroy()
+				
+				-- Remove from collision list
+				for i = #m.box2d_collision, 1, -1 do
+					if m.box2d_collision[i] == oldEntry then
+						table.remove(m.box2d_collision, i)
+						break
+					end
+				end
+				
+				m.box2d_tileMap[layerName][y][x] = nil
+			end
+			
+			-- Add new collision if tile is collidable
+			if newTile and (newTile.properties and newTile.properties.collidable or layer.properties.collidable) then
+				local properties = newTile.properties or {}
+				local tileX = (x - 1) * m.tilewidth + m.offsetx
+				local tileY = (y - 1) * m.tileheight + m.offsety
+				
+				-- Create simple rectangle collision for the tile
+				local vertices = {
+					tileX, tileY,
+					tileX + m.tilewidth, tileY,
+					tileX + m.tilewidth, tileY + m.tileheight,
+					tileX, tileY + m.tileheight
+				}
+				
+				local shape = love.physics.newPolygonShape(unpack(vertices))
+				
+				-- Determine body type
+				local currentBody = body
+				if properties.dynamic then
+					currentBody = love.physics.newBody(world, m.offsetx, m.offsety, 'dynamic')
+				elseif properties.static then
+					currentBody = love.physics.newBody(world, m.offsetx, m.offsety, 'static')
+				elseif properties.kinematic then
+					currentBody = love.physics.newBody(world, m.offsetx, m.offsety, 'kinematic')
+				end
+				
+				local fixture = love.physics.newFixture(currentBody, shape)
+				
+				local userdata = {
+					object = {
+						shape = "rectangle",
+						x = tileX,
+						y = tileY,
+						w = m.tilewidth,
+						h = m.tileheight,
+						layer = layer
+					},
+					properties = properties
+				}
+				fixture:setUserData(userdata)
+				
+				-- Set properties
+				fixture:setFriction(properties.friction or 0.2)
+				fixture:setRestitution(properties.restitution or 0.0)
+				fixture:setSensor(properties.sensor or false)
+				fixture:setFilterData(
+					properties.categories or 1,
+					properties.mask or 65535,
+					properties.group or 0
+				)
+				
+				local entry = {
+					object = userdata.object,
+					body = currentBody,
+					shape = shape,
+					fixture = fixture
+				}
+				
+				table.insert(m.box2d_collision, entry)
+				
+				-- Add to reverse lookup
+				m.box2d_tileMap[layerName] = m.box2d_tileMap[layerName] or {}
+				m.box2d_tileMap[layerName][y] = m.box2d_tileMap[layerName][y] or {}
+				m.box2d_tileMap[layerName][y][x] = entry
+			end
+		end)
 	end,
 
 	--- Remove Box2D fixtures and shapes from world.

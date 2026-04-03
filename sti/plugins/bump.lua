@@ -145,6 +145,65 @@ return {
 
 		map.bump_world       = world
 		map.bump_collidables = collidables
+		map.bump_tileMap     = {}  -- Reverse lookup: [layerName][y][x] = collidable
+
+		-- Build reverse lookup for tile-based collidables
+		for _, collidable in ipairs(collidables) do
+			if collidable.layer and collidable.layer.type == "tilelayer" then
+				-- Calculate tile position from pixel position
+				local tileX = math.floor((collidable.x - map.offsetx) / map.tilewidth) + 1
+				local tileY = math.floor((collidable.y - map.offsety) / map.tileheight) + 1
+				
+				local layerName = collidable.layer.name
+				map.bump_tileMap[layerName] = map.bump_tileMap[layerName] or {}
+				map.bump_tileMap[layerName][tileY] = map.bump_tileMap[layerName][tileY] or {}
+				map.bump_tileMap[layerName][tileY][tileX] = collidable
+			end
+		end
+
+		-- Register callback for dynamic tile changes
+		map:registerTileCallback(function(m, layer, x, y, oldTile, newTile)
+			local layerName = layer.name
+			
+			-- Remove old collision if exists
+			if oldTile and m.bump_tileMap[layerName] and m.bump_tileMap[layerName][y] and m.bump_tileMap[layerName][y][x] then
+				local oldCollidable = m.bump_tileMap[layerName][y][x]
+				m.bump_world:remove(oldCollidable)
+				
+				-- Remove from collidables list
+				for i = #m.bump_collidables, 1, -1 do
+					if m.bump_collidables[i] == oldCollidable then
+						table.remove(m.bump_collidables, i)
+						break
+					end
+				end
+				
+				m.bump_tileMap[layerName][y][x] = nil
+			end
+			
+			-- Add new collision if tile is collidable
+			if newTile and (newTile.properties and newTile.properties.collidable or layer.properties.collidable) then
+				local offset = newTile.offset or {x = 0, y = 0}
+				local properties = newTile.properties or {}
+				local t = {
+					x          = (x - 1) * m.tilewidth + offset.x + m.offsetx,
+					y          = (y - 1) * m.tileheight + offset.y + m.offsety,
+					width      = newTile.width or m.tilewidth,
+					height     = newTile.height or m.tileheight,
+					layer      = layer,
+					type       = newTile.type,
+					properties = properties
+				}
+				
+				m.bump_world:add(t, t.x, t.y, t.width, t.height)
+				table.insert(m.bump_collidables, t)
+				
+				-- Add to reverse lookup
+				m.bump_tileMap[layerName] = m.bump_tileMap[layerName] or {}
+				m.bump_tileMap[layerName][y] = m.bump_tileMap[layerName][y] or {}
+				m.bump_tileMap[layerName][y][x] = t
+			end
+		end)
 	end,
 
 	--- Remove layer

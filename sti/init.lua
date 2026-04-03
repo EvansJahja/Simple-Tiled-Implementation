@@ -1819,6 +1819,32 @@ function Map:buildWangLookups()
 			end
 		end
 	end
+
+	-- Auto-initialize terrain data for all tile layers with wang tiles
+	for _, layer in ipairs(self.layers) do
+		if layer.type == "tilelayer" and layer.data then
+			for y = 1, layer.height do
+				for x = 1, layer.width do
+					local tile = layer.data[y] and layer.data[y][x]
+					if tile then
+						local wangInfo = self.gidToWangInfo[tile.gid]
+						if wangInfo then
+							if not layer.terrainData then
+								layer.terrainData = {}
+							end
+							if not layer.terrainData[y] then
+								layer.terrainData[y] = {}
+							end
+							layer.terrainData[y][x] = {
+								wangset = wangInfo.wangset,
+								colorId = wangInfo.colorId
+							}
+						end
+					end
+				end
+			end
+		end
+	end
 end
 
 -- Convert Wang ID array to string key for hash lookup (internal helper)
@@ -2005,18 +2031,17 @@ end
 -- @param colorId Color/terrain ID to place (1-based index into wangset.colors)
 -- @usage map:setTerrain("Ground", 5, 10, "Grass Terrain", 1)
 function Map:setTerrain(layer, x, y, wangsetName, colorId)
+	local layerName = layer
 	if type(layer) == "string" then
 		layer = self.layers[layer]
 	end
 
 	if not layer then
-		error("Layer not found")
-		return
+		error("Layer '" .. tostring(layerName) .. "' not found")
 	end
 
 	if not self.wangsets[wangsetName] then
 		error("Wangset '" .. tostring(wangsetName) .. "' not found")
-		return
 	end
 
 	-- Initialize terrain data storage if needed
@@ -2049,12 +2074,13 @@ end
 -- @param y Tile Y coordinate (1-based)
 -- @usage map:removeTerrain("Ground", 5, 10)
 function Map:removeTerrain(layer, x, y)
+	local layerName = layer
 	if type(layer) == "string" then
 		layer = self.layers[layer]
 	end
 
 	if not layer then
-		return
+		error("Layer '" .. tostring(layerName) .. "' not found")
 	end
 
 	-- Clear terrain data at this position
@@ -2083,12 +2109,17 @@ end
 -- @param colorId Color/terrain ID to place
 -- @usage map:setTerrainRect("Ground", 5, 5, 8, 8, "Grass Terrain", 1) -- 4x4 area
 function Map:setTerrainRect(layer, x1, y1, x2, y2, wangsetName, colorId)
+	local layerName = layer
 	if type(layer) == "string" then
 		layer = self.layers[layer]
 	end
 
 	if not layer then
-		return
+		error("Layer '" .. tostring(layerName) .. "' not found")
+	end
+
+	if not self.wangsets[wangsetName] then
+		error("Wangset '" .. tostring(wangsetName) .. "' not found")
 	end
 
 	-- Normalize coordinates
@@ -2130,12 +2161,17 @@ end
 -- @param y2 End Y coordinate (1-based, inclusive)
 -- @usage map:removeTerrainRect("Ground", 5, 5, 8, 8)
 function Map:removeTerrainRect(layer, x1, y1, x2, y2)
+	local layerName = layer
 	if type(layer) == "string" then
 		layer = self.layers[layer]
 	end
 
-	if not layer or not layer.terrainData then
-		return
+	if not layer then
+		error("Layer '" .. tostring(layerName) .. "' not found")
+	end
+
+	if not layer.terrainData then
+		return  -- No terrain data to remove, not an error
 	end
 
 	-- Normalize coordinates
@@ -2160,21 +2196,26 @@ function Map:removeTerrainRect(layer, x1, y1, x2, y2)
 end
 
 --- Initialize terrain data from existing tiles on a layer.
--- Call this if you want to modify terrain that was painted in Tiled editor.
--- Without this, the layer has tiles but no terrainData, so removeTerrain()
--- wouldn't know which tiles belong to which terrain.
+-- NOTE: This is called automatically during map load for all tile layers.
+-- You only need to call this manually if you've modified tiles directly
+-- (bypassing setTerrain) and want to re-sync the terrain data.
 -- Scans all tiles and uses gidToWangInfo (reverse lookup) to populate terrainData.
 -- @param layer Layer name (string) or layer object
 -- @param wangsetName Optional: only detect tiles from this wangset (nil = all)
--- @usage map:initTerrainFromLayer("Ground")  -- Detect all terrain
+-- @usage map:initTerrainFromLayer("Ground")  -- Re-sync all terrain
 -- @usage map:initTerrainFromLayer("Ground", "Hills")  -- Only Hills wangset
 function Map:initTerrainFromLayer(layer, wangsetName)
+	local layerName = layer
 	if type(layer) == "string" then
 		layer = self.layers[layer]
 	end
 
-	if not layer or not layer.data then
-		return
+	if not layer then
+		error("Layer '" .. tostring(layerName) .. "' not found")
+	end
+
+	if not layer.data then
+		return  -- Layer has no tile data, not an error
 	end
 
 	layer.terrainData = {}

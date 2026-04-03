@@ -143,6 +143,9 @@ function Map:init(path, plugins, ox, oy)
 	for _, layer in ipairs(self.layers) do
 		self:setLayer(layer, path)
 	end
+
+	-- Build Wang tile lookup tables for terrain support
+	self:buildWangLookups()
 end
 
 --- Layers from the group are added to the list
@@ -1254,10 +1257,12 @@ function Map:setLayerTile(layer, x, y, gid)
 	local instance
 	if tile then
 		local tileX, tileY = self:getLayerTilePosition(layer, tile, x, y)
-		for _, inst in pairs(self.tileInstances[tile.gid]) do
-			if inst.x == tileX and inst.y == tileY then
-				instance = inst
-				break
+		if self.tileInstances[tile.gid] then
+			for _, inst in pairs(self.tileInstances[tile.gid]) do
+				if inst.x == tileX and inst.y == tileY then
+					instance = inst
+					break
+				end
 			end
 		end
 	end
@@ -1271,7 +1276,7 @@ function Map:setLayerTile(layer, x, y, gid)
 	if instance then
 		self:swapTile(instance, tile)
 	else
-		self:addNewLayerTile(layer, tile, x, y)
+		self:addNewLayerTile(layer, nil, tile, x, y)
 	end
 	layer.data[y][x] = tile
 end
@@ -1744,5 +1749,475 @@ end
 -- @field polygon List of verticies of specific shape
 -- @field polyline List of verticies of specific shape
 -- @see Map.objects
+
+--- Build Wang tile (terrain) lookup tables from tileset wangsets data.
+-- This function MUST be called after loading a map if you want to use terrain functions.
+-- It parses the wangsets embedded in tilesets and creates:
+--   - Forward lookup (wangIdToGids): Given a Wang pattern, find matching tiles
+--   - Reverse lookup (gidToWangInfo): Given a tile GID, find its Wang info
+-- Without these lookups, setTerrain/removeTerrain will not work.
+-- Called automatically during Map:init() if wangsets are present.
+-- @local
+function Map:buildWangLookups()
+	self.wangsets = {}
+	self.wangIdToGids = {}   -- wangsetName -> wangIdKey -> list of {gid, probability}
+	self.gidToWangInfo = {}  -- gid -> {wangset, wangId, colorId}
+
+	for tilesetIdx, tileset in ipairs(self.tilesets) do
+		if tileset.wangsets then
+			for _, wangset in ipairs(tileset.wangsets) do
+				local wsName = wangset.name
+				self.wangsets[wsName] = {
+					name = wsName,
+					type = wangset.wangsettype,
+					colors = wangset.colors,
+					tileset = tileset,
+					tilesetIndex = tilesetIdx,
+					firstgid = tileset.firstgid
+				}
+				self.wangIdToGids[wsName] = {}
+
+				-- Build wangId -> gid mappings
+				for _, wangtile in ipairs(wangset.wangtiles) do
+					local gid = tileset.firstgid + wangtile.tileid
+					local wangIdKey = table.concat(wangtile.wangid, ",")
+
+					-- Get probability from the dominant color in the wangid
+					local probability = 1
+					for _, colorIdx in ipairs(wangtile.wangid) do
+						if colorIdx > 0 and wangset.colors[colorIdx] then
+							probability = wangset.colors[colorIdx].probability or 1
+							break
+						end
+					end
+
+					-- Store in lookup table (multiple tiles can match same wangId)
+					if not self.wangIdToGids[wsName][wangIdKey] then
+						self.wangIdToGids[wsName][wangIdKey] = {}
+					end
+					table.insert(self.wangIdToGids[wsName][wangIdKey], {
+						gid = gid,
+						probability = probability
+					})
+
+					-- Build reverse lookup: gid -> wangInfo
+					-- Find the primary colorId (first non-zero in wangid)
+					local colorId = 0
+					for _, c in ipairs(wangtile.wangid) do
+						if c > 0 then
+							colorId = c
+							break
+						end
+					end
+
+					self.gidToWangInfo[gid] = {
+						wangset = wsName,
+						wangId = wangtile.wangid,
+						colorId = colorId
+					}
+				end
+			end
+		end
+	end
+end
+
+-- Convert Wang ID array to string key for hash lookup (internal helper)
+local function wangIdToKey(wangId)
+	return table.concat(wangId, ",")
+end
+
+-- Select a tile from candidates weighted by probability (internal helper)
+-- Tiled allows multiple tiles to share the same Wang ID with different probabilities.
+-- This provides visual variety when painting terrain.
+local function selectWeightedTile(candidates)
+	if #candidates == 0 then
+		return nil
+	end
+	if #candidates == 1 then
+		return candidates[1].gid
+	end
+
+	-- Calculate total probability weight
+	local totalWeight = 0
+	for _, c in ipairs(candidates) do
+		totalWeight = totalWeight + c.probability
+	end
+
+	-- Random selection weighted by probability
+	local roll = math.random() * totalWeight
+	local cumulative = 0
+	for _, c in ipairs(candidates) do
+		cumulative = cumulative + c.probability
+		if roll <= cumulative then
+			return c.gid
+		end
+	end
+
+	return candidates[#candidates].gid
+end
+
+--- Get the terrain data at a tile position.
+-- Used internally by computeWangId to check neighboring tiles.
+-- Also useful for querying terrain state in game logic.
+-- @param layer The layer name (string) or layer object
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @return table {wangset=string, colorId=number} or nil if no terrain
+-- @usage local t = map:getTerrain("Ground", 5, 10)
+-- @usage if t then print("Has terrain: " .. t.wangset) end
+function Map:getTerrain(layer, x, y)
+	if type(layer) == "string" then
+		layer = self.layers[layer]
+	end
+	if not layer or not layer.terrainData then
+		return nil
+	end
+	if layer.terrainData[y] then
+		return layer.terrainData[y][x]
+	end
+	return nil
+end
+
+--- Compute the Wang ID for a position based on neighboring terrain.
+-- This is the core algorithm that examines all 8 neighbors and produces
+-- an 8-value pattern that uniquely identifies what tile shape is needed.
+--
+-- Wang ID format (Tiled order, 8 values clockwise from top):
+--   [1]=Top edge, [2]=Top-Right corner, [3]=Right edge, [4]=Bottom-Right corner,
+--   [5]=Bottom edge, [6]=Bottom-Left corner, [7]=Left edge, [8]=Top-Left corner
+--
+-- For "mixed" wangsets (terrain with both edges and corners), corners are only
+-- set when BOTH adjacent edges are present. This ensures proper tile transitions.
+-- @local
+-- @param layer The layer object (not name)
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @param wangsetName Name of the wangset
+-- @param colorId The color ID (terrain type) to check for
+-- @return table 8-value Wang ID array where each value is colorId or 0
+function Map:computeWangId(layer, x, y, wangsetName, colorId)
+	local wangId = {0, 0, 0, 0, 0, 0, 0, 0}
+
+	-- Helper to check if a neighbor has the same terrain color
+	local function hasColor(nx, ny)
+		local terrain = self:getTerrain(layer, nx, ny)
+		if terrain and terrain.wangset == wangsetName and terrain.colorId == colorId then
+			return true
+		end
+		return false
+	end
+
+	-- Check all 8 neighbors
+	local n  = hasColor(x, y - 1)      -- North
+	local ne = hasColor(x + 1, y - 1)  -- North-East (diagonal)
+	local e  = hasColor(x + 1, y)      -- East
+	local se = hasColor(x + 1, y + 1)  -- South-East (diagonal)
+	local s  = hasColor(x, y + 1)      -- South
+	local sw = hasColor(x - 1, y + 1)  -- South-West (diagonal)
+	local w  = hasColor(x - 1, y)      -- West
+	local nw = hasColor(x - 1, y - 1)  -- North-West (diagonal)
+
+	-- Edges (even Tiled indices: 0, 2, 4, 6 -> Lua indices 1, 3, 5, 7)
+	wangId[1] = n and colorId or 0   -- Top edge (index 0)
+	wangId[3] = e and colorId or 0   -- Right edge (index 2)
+	wangId[5] = s and colorId or 0   -- Bottom edge (index 4)
+	wangId[7] = w and colorId or 0   -- Left edge (index 6)
+
+	-- Corners (odd Tiled indices: 1, 3, 5, 7 -> Lua indices 2, 4, 6, 8)
+	-- For mixed wangsets, corners require BOTH adjacent edges to be filled
+	wangId[2] = (n and e and ne) and colorId or 0  -- Top-Right corner (needs T and R edges)
+	wangId[4] = (e and s and se) and colorId or 0  -- Bottom-Right corner (needs R and B edges)
+	wangId[6] = (s and w and sw) and colorId or 0  -- Bottom-Left corner (needs B and L edges)
+	wangId[8] = (w and n and nw) and colorId or 0  -- Top-Left corner (needs L and T edges)
+
+	return wangId
+end
+
+--- Find a matching tile GID for a computed Wang ID.
+-- Looks up the pre-built wangIdToGids table created by buildWangLookups().
+-- If multiple tiles match (Tiled allows this for variety), one is selected
+-- randomly weighted by the probability set in Tiled.
+-- @local
+-- @param wangsetName Name of the wangset
+-- @param wangId 8-value Wang ID array from computeWangId()
+-- @return number GID of matching tile, or nil if no tile matches this pattern
+function Map:findWangTile(wangsetName, wangId)
+	local lookup = self.wangIdToGids[wangsetName]
+	if not lookup then
+		return nil
+	end
+
+	local key = wangIdToKey(wangId)
+	local candidates = lookup[key]
+
+	if not candidates or #candidates == 0 then
+		return nil
+	end
+
+	return selectWeightedTile(candidates)
+end
+
+--- Update a single tile's visual based on its terrain context.
+-- This is the workhorse function that ties everything together:
+-- 1. Reads the terrain data at (x,y) via getTerrain()
+-- 2. Computes the required Wang ID via computeWangId()
+-- 3. Finds the matching tile via findWangTile()
+-- 4. Updates the layer via setLayerTile()
+-- Called internally by setTerrain/removeTerrain for the affected area.
+-- @local
+-- @param layer Layer object (not name)
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+function Map:updateTerrainTile(layer, x, y)
+	-- Bounds check
+	if x < 1 or y < 1 or x > layer.width or y > layer.height then
+		return
+	end
+
+	local terrain = self:getTerrain(layer, x, y)
+
+	if terrain then
+		-- This tile has terrain - compute correct wang tile
+		local wangId = self:computeWangId(layer, x, y, terrain.wangset, terrain.colorId)
+		local gid = self:findWangTile(terrain.wangset, wangId)
+
+		if gid then
+			self:setLayerTile(layer.name, x, y, gid)
+		end
+	else
+		-- No terrain here - clear the tile
+		-- Check if current tile is a wang tile that should be removed
+		local currentTile = layer.data[y] and layer.data[y][x]
+		if currentTile and self.gidToWangInfo[currentTile.gid] then
+			self:setLayerTile(layer.name, x, y, nil)
+		end
+	end
+end
+
+--- Set terrain at a tile position and update surrounding tiles.
+-- This is the main public API for placing terrain dynamically.
+-- It stores the terrain data and updates the tile plus all 8 neighbors,
+-- since neighbor tiles may need different shapes after this change.
+-- @param layer Layer name (string) or layer object
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @param wangsetName Name of the wangset (as defined in Tiled)
+-- @param colorId Color/terrain ID to place (1-based index into wangset.colors)
+-- @usage map:setTerrain("Ground", 5, 10, "Grass Terrain", 1)
+function Map:setTerrain(layer, x, y, wangsetName, colorId)
+	if type(layer) == "string" then
+		layer = self.layers[layer]
+	end
+
+	if not layer then
+		error("Layer not found")
+		return
+	end
+
+	if not self.wangsets[wangsetName] then
+		error("Wangset '" .. tostring(wangsetName) .. "' not found")
+		return
+	end
+
+	-- Initialize terrain data storage if needed
+	if not layer.terrainData then
+		layer.terrainData = {}
+	end
+	if not layer.terrainData[y] then
+		layer.terrainData[y] = {}
+	end
+
+	-- Set the terrain at this position
+	layer.terrainData[y][x] = {
+		wangset = wangsetName,
+		colorId = colorId
+	}
+
+	-- Update this tile and all 8 neighbors
+	for dy = -1, 1 do
+		for dx = -1, 1 do
+			self:updateTerrainTile(layer, x + dx, y + dy)
+		end
+	end
+end
+
+--- Remove terrain at a tile position and update surrounding tiles.
+-- Clears the terrain data and removes the tile. Also updates all 8 neighbors
+-- since they may need different edge/corner shapes.
+-- @param layer Layer name (string) or layer object
+-- @param x Tile X coordinate (1-based)
+-- @param y Tile Y coordinate (1-based)
+-- @usage map:removeTerrain("Ground", 5, 10)
+function Map:removeTerrain(layer, x, y)
+	if type(layer) == "string" then
+		layer = self.layers[layer]
+	end
+
+	if not layer then
+		return
+	end
+
+	-- Clear terrain data at this position
+	if layer.terrainData and layer.terrainData[y] then
+		layer.terrainData[y][x] = nil
+	end
+
+	-- Update this tile and all 8 neighbors
+	for dy = -1, 1 do
+		for dx = -1, 1 do
+			self:updateTerrainTile(layer, x + dx, y + dy)
+		end
+	end
+end
+
+--- Set terrain for a rectangular area (batch operation).
+-- More efficient than calling setTerrain() in a loop because it only
+-- updates the border tiles once after setting all terrain data.
+-- Useful for filling larger areas or creating buildings/platforms.
+-- @param layer Layer name (string) or layer object
+-- @param x1 Start X coordinate (1-based, inclusive)
+-- @param y1 Start Y coordinate (1-based, inclusive)
+-- @param x2 End X coordinate (1-based, inclusive)
+-- @param y2 End Y coordinate (1-based, inclusive)
+-- @param wangsetName Name of the wangset
+-- @param colorId Color/terrain ID to place
+-- @usage map:setTerrainRect("Ground", 5, 5, 8, 8, "Grass Terrain", 1) -- 4x4 area
+function Map:setTerrainRect(layer, x1, y1, x2, y2, wangsetName, colorId)
+	if type(layer) == "string" then
+		layer = self.layers[layer]
+	end
+
+	if not layer then
+		return
+	end
+
+	-- Normalize coordinates
+	if x1 > x2 then x1, x2 = x2, x1 end
+	if y1 > y2 then y1, y2 = y2, y1 end
+
+	-- Initialize terrain data
+	if not layer.terrainData then
+		layer.terrainData = {}
+	end
+
+	-- Set terrain for all tiles in rectangle
+	for y = y1, y2 do
+		if not layer.terrainData[y] then
+			layer.terrainData[y] = {}
+		end
+		for x = x1, x2 do
+			layer.terrainData[y][x] = {
+				wangset = wangsetName,
+				colorId = colorId
+			}
+		end
+	end
+
+	-- Update all affected tiles (rectangle + 1 tile border)
+	for y = y1 - 1, y2 + 1 do
+		for x = x1 - 1, x2 + 1 do
+			self:updateTerrainTile(layer, x, y)
+		end
+	end
+end
+
+--- Remove terrain from a rectangular area (batch operation).
+-- More efficient than calling removeTerrain() in a loop.
+-- @param layer Layer name (string) or layer object
+-- @param x1 Start X coordinate (1-based, inclusive)
+-- @param y1 Start Y coordinate (1-based, inclusive)
+-- @param x2 End X coordinate (1-based, inclusive)
+-- @param y2 End Y coordinate (1-based, inclusive)
+-- @usage map:removeTerrainRect("Ground", 5, 5, 8, 8)
+function Map:removeTerrainRect(layer, x1, y1, x2, y2)
+	if type(layer) == "string" then
+		layer = self.layers[layer]
+	end
+
+	if not layer or not layer.terrainData then
+		return
+	end
+
+	-- Normalize coordinates
+	if x1 > x2 then x1, x2 = x2, x1 end
+	if y1 > y2 then y1, y2 = y2, y1 end
+
+	-- Clear terrain for all tiles in rectangle
+	for y = y1, y2 do
+		if layer.terrainData[y] then
+			for x = x1, x2 do
+				layer.terrainData[y][x] = nil
+			end
+		end
+	end
+
+	-- Update all affected tiles (rectangle + 1 tile border)
+	for y = y1 - 1, y2 + 1 do
+		for x = x1 - 1, x2 + 1 do
+			self:updateTerrainTile(layer, x, y)
+		end
+	end
+end
+
+--- Initialize terrain data from existing tiles on a layer.
+-- Call this if you want to modify terrain that was painted in Tiled editor.
+-- Without this, the layer has tiles but no terrainData, so removeTerrain()
+-- wouldn't know which tiles belong to which terrain.
+-- Scans all tiles and uses gidToWangInfo (reverse lookup) to populate terrainData.
+-- @param layer Layer name (string) or layer object
+-- @param wangsetName Optional: only detect tiles from this wangset (nil = all)
+-- @usage map:initTerrainFromLayer("Ground")  -- Detect all terrain
+-- @usage map:initTerrainFromLayer("Ground", "Hills")  -- Only Hills wangset
+function Map:initTerrainFromLayer(layer, wangsetName)
+	if type(layer) == "string" then
+		layer = self.layers[layer]
+	end
+
+	if not layer or not layer.data then
+		return
+	end
+
+	layer.terrainData = {}
+
+	for y = 1, layer.height do
+		for x = 1, layer.width do
+			local tile = layer.data[y] and layer.data[y][x]
+			if tile then
+				local wangInfo = self.gidToWangInfo[tile.gid]
+				if wangInfo and (not wangsetName or wangInfo.wangset == wangsetName) then
+					if not layer.terrainData[y] then
+						layer.terrainData[y] = {}
+					end
+					layer.terrainData[y][x] = {
+						wangset = wangInfo.wangset,
+						colorId = wangInfo.colorId
+					}
+				end
+			end
+		end
+	end
+end
+
+--- Get list of available wangset names.
+-- Useful for debugging or building terrain selection UI.
+-- @return table Array of wangset name strings
+-- @usage for _, name in ipairs(map:getWangsetNames()) do print(name) end
+function Map:getWangsetNames()
+	local names = {}
+	for name, _ in pairs(self.wangsets) do
+		table.insert(names, name)
+	end
+	return names
+end
+
+--- Get wangset metadata by name.
+-- Returns the parsed wangset data including colors, type, and tileset reference.
+-- @param name Wangset name (string)
+-- @return table {name, type, colors, tileset, firstgid} or nil if not found
+-- @usage local ws = map:getWangset("Grass Terrain")
+-- @usage print("Type: " .. ws.type)  -- "corner", "edge", or "mixed"
+function Map:getWangset(name)
+	return self.wangsets[name]
+end
 
 return setmetatable({}, STI)
